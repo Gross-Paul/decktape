@@ -54,11 +54,14 @@ class Reveal {
           autoAnimate: false,
         });
 
-        // This is a workaround to disable the open button of the RevealMenu plugin.
+        // This is a workaround to disable the open button of the RevealMenu plugin
+        // and to disable the open button of the Chalkboard plugin.
         // See the following issue for more details: https://github.com/denehyg/reveal.js-menu/issues/99
-        var menuOpenButtons = document.getElementsByClassName('slide-menu-button');
-        for (var i = 0; i < menuOpenButtons.length; i++) {
-          menuOpenButtons[i].style.display = 'none';
+        for (const menuClass of ['slide-menu-button', 'slide-chalkboard-buttons']) {
+          var menuOpenButtons = document.getElementsByClassName(menuClass);
+          for (var i = 0; i < menuOpenButtons.length; i++) {
+            menuOpenButtons[i].style.display = 'none';
+          }
         }
       },
       {
