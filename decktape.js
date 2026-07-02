@@ -112,6 +112,13 @@ parser.script('decktape').options({
     transform : parseHeaders,
     help      : 'HTTP headers, comma-separated list of <header>,<value> pairs (e.g. "Authorization,\'Bearer ASDJASLKJALKSJDL\'")',
   },
+  // Parallelization options
+  parallel : {
+    metavar   : '<count>',
+    default   : 1,
+    type      : 'number',
+    help      : 'Number of parallel workers to use for PDF export (1-8)',
+  },
   // Chrome options
   chromePath : {
     full    : 'chrome-path',
@@ -251,6 +258,12 @@ process.on('unhandledRejection', error => {
   });
   const options = parser.parse(process.argv.slice(2));
 
+  // Validate parallel option
+  const parallelWorkers = Math.max(1, Math.min(8, options.parallel || 1));
+  if (parallelWorkers > 1) {
+    console.log(chalk.cyan(`Using ${parallelWorkers} parallel workers for PDF export`));
+  }
+
   const browser = await puppeteer.launch({
     headless       : options.headless,
     // TODO: add a verbose option
@@ -300,7 +313,7 @@ process.on('unhandledRejection', error => {
     .then(_ => createPlugin(page, plugins, options))
     .then(plugin => configurePlugin(plugin)
       .then(_ => configurePage(page, plugin, options))
-      .then(_ => exportSlides(page, plugin, pdf, options))
+      .then(_ => parallelWorkers > 1 ? exportSlidesParallel(browser, page, plugin, pdf, options, parallelWorkers, plugins) : exportSlides(page, plugin, pdf, options))
       .then(async context => {
         await writePdf(options.filename, pdf);
         console.log(chalk.green(`\nPrinted ${chalk.bold('%s')} slides`), context.exportedSlides);
@@ -363,6 +376,146 @@ async function configurePage(page, plugin, options) {
 async function configurePlugin(plugin) {
   if (typeof plugin.configure === 'function') {
     await plugin.configure();
+  }
+}
+
+/**
+ * Export slides with parallel processing
+ * Multiple pages render slides concurrently, then results are assembled in order
+ */
+async function exportSlidesParallel(browser, primaryPage, plugin, pdf, options, parallelWorkers, allPlugins) {
+  const context = {
+    progressBarOverflow : 0,
+    currentSlide        : 1,
+    exportedSlides      : 0,
+    pdfFonts            : {},
+    pdfXObjects         : {},
+    totalSlides         : await plugin.slideCount(),
+  };
+
+  // Create additional worker pages
+  const workerPages = [primaryPage];
+  const workerPlugins = [plugin];
+  
+  for (let i = 1; i < parallelWorkers; i++) {
+    const workerPage = await browser.newPage();
+    if (options.headers)
+      workerPage.setExtraHTTPHeaders(options.headers)
+    await workerPage.emulateMediaType('screen');
+    
+    console.log(`Initializing worker ${i + 1}/${parallelWorkers}...`);
+    await workerPage.goto(options.url, { waitUntil: 'networkidle0', timeout: options.pageLoadTimeout });
+    await pause(options.loadPause);
+    
+    const workerPlugin = await createPlugin(workerPage, allPlugins, options);
+    await configurePlugin(workerPlugin);
+    await configurePage(workerPage, workerPlugin, options);
+    
+    workerPages.push(workerPage);
+    workerPlugins.push(workerPlugin);
+  }
+
+  // Build list of slides to export
+  const maxSlide = options.slides ? Math.max(...Object.keys(options.slides)) : context.totalSlides;
+  const slidesToExport = [];
+  
+  for (let i = 1; i <= context.totalSlides && i <= maxSlide; i++) {
+    if (!options.slides || options.slides[i]) {
+      slidesToExport.push(i);
+    }
+  }
+
+  console.log(`Exporting ${slidesToExport.length} slides with ${parallelWorkers} workers...`);
+
+  // Process slides in parallel batches
+  const exportedSlides = new Map(); // slide number -> PDF buffer
+  const batchSize = Math.max(1, Math.ceil(slidesToExport.length / (parallelWorkers * 2)));
+
+  for (let batch = 0; batch < slidesToExport.length; batch += batchSize) {
+    const batchSlides = slidesToExport.slice(batch, Math.min(batch + batchSize, slidesToExport.length));
+    
+    const exportPromises = batchSlides.map(async (slideNum, idx) => {
+      const workerIndex = idx % parallelWorkers;
+      const workerPage = workerPages[workerIndex];
+      const workerPlugin = workerPlugins[workerIndex];
+      
+      // Navigate to the correct slide
+      await navigateToSlide(workerPage, workerPlugin, slideNum);
+      await pause(options.pause);
+      
+      // Pause videos and seek to start
+      await workerPage.evaluate(() => document.querySelectorAll('video').forEach(v => { v.pause(); v.currentTime = 0; }));
+      
+      // Export the slide
+      const buffer = await workerPage.pdf({
+        width               : options.size.width,
+        height              : options.size.height,
+        printBackground     : true,
+        pageRanges          : '1',
+        displayHeaderFooter : false,
+        timeout             : options.bufferTimeout,
+      });
+      
+      return { slideNum, buffer };
+    });
+
+    const results = await Promise.all(exportPromises);
+    
+    // Store results in order
+    for (const { slideNum, buffer } of results) {
+      exportedSlides.set(slideNum, buffer);
+      const progress = Math.min(batch + batchSlides.length, slidesToExport.length);
+      process.stdout.write('\r' + `Rendering slides ${progress}/${slidesToExport.length} ...`);
+    }
+  }
+
+  process.stdout.write('\n');
+
+  // Assemble exported slides in order
+  for (const slideNum of slidesToExport) {
+    const buffer = exportedSlides.get(slideNum);
+    await printSlide(pdf, await PDFDocument.load(buffer, { parseSpeed: ParseSpeeds.Fastest }), context);
+    context.exportedSlides++;
+  }
+
+  // Flush consolidated fonts
+  Object.values(context.pdfFonts).forEach(({ ref, font }) => {
+    pdf.context.assign(ref, pdf.context.flateStream(font.write({ type: 'ttf', hinting: true })));
+  });
+
+  // Close worker pages (except the primary)
+  for (let i = 1; i < workerPages.length; i++) {
+    await workerPages[i].close();
+  }
+
+  return context;
+}
+
+/**
+ * Navigate to a specific slide number using the plugin's nextSlide method
+ */
+async function navigateToSlide(page, plugin, targetSlideNum) {
+  // Get current position
+  const currentIndex = await page.evaluate(() => {
+    if (typeof Reveal !== 'undefined') {
+      const state = Reveal.getState();
+      return state.indexh;
+    }
+    return null;
+  });
+
+  if (currentIndex === null) return; // Plugin doesn't expose state
+
+  const diff = targetSlideNum - (currentIndex + 1);
+
+  if (diff > 0) {
+    for (let i = 0; i < diff; i++) {
+      await plugin.nextSlide();
+    }
+  } else if (diff < 0) {
+    for (let i = 0; i < Math.abs(diff); i++) {
+      await page.evaluate(() => Reveal.prev?.());
+    }
   }
 }
 
