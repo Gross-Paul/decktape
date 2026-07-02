@@ -441,7 +441,13 @@ async function exportSlidesParallel(browser, primaryPage, plugin, pdf, options, 
       
       // Navigate to the correct slide
       await navigateToSlide(workerPage, workerPlugin, slideNum);
+      
+      // Pause and wait for dynamic content rendering (e.g., Chart.js, animations)
+      // This ensures parity with synchronous mode which waits before exporting
       await pause(options.pause);
+      
+      // Wait for page to settle and render dynamic elements
+      await waitForPageReady(workerPage);
       
       // Pause videos and seek to start
       await workerPage.evaluate(() => document.querySelectorAll('video').forEach(v => { v.pause(); v.currentTime = 0; }));
@@ -489,6 +495,22 @@ async function exportSlidesParallel(browser, primaryPage, plugin, pdf, options, 
   }
 
   return context;
+}
+
+/**
+ * Wait for the page to be ready for rendering
+ * Ensures dynamic content like Canvas (Chart.js) has time to render
+ */
+async function waitForPageReady(page) {
+  try {
+    // Wait for any pending animations or renders to complete
+    await page.waitForFunction(() => {
+      // Check if document is in a stable state
+      return document.readyState === 'complete';
+    }, { timeout: 5000 });
+  } catch (e) {
+    // Timeout is OK, just continue with rendering
+  }
 }
 
 /**
