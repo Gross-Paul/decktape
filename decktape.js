@@ -380,106 +380,86 @@ async function configurePlugin(plugin) {
 }
 
 /**
- * Export slides with parallel processing
- * Multiple pages render slides concurrently, then results are assembled in order
+ * Export slides with parallel processing.
+ * Each worker owns a dedicated Puppeteer page and walks the deck from slide 1
+ * using the plugin's own nextSlide()/hasNextSlide() API (same as sequential mode),
+ * only pausing and capturing a PDF once it reaches its assigned range. This keeps
+ * navigation correct for every plugin (not just reveal.js) and guarantees two
+ * workers never touch the same page concurrently.
  */
 async function exportSlidesParallel(browser, primaryPage, plugin, pdf, options, parallelWorkers, allPlugins) {
+  if (options.screenshots) {
+    console.log(chalk.yellow('\n--screenshots is not yet supported with --parallel; falling back to sequential export.'));
+    return exportSlides(primaryPage, plugin, pdf, options);
+  }
+
+  const totalSlides = await plugin.slideCount();
+  if (!totalSlides) {
+    console.log(chalk.yellow(
+      `\n${plugin.getName()} plugin cannot report a total slide count in advance, so work cannot be ` +
+      `split across parallel workers; falling back to sequential export.`));
+    return exportSlides(primaryPage, plugin, pdf, options);
+  }
+
+  const maxSlide = options.slides
+    ? Math.min(totalSlides, Math.max(...Object.keys(options.slides)))
+    : totalSlides;
+  const workerCount = Math.max(1, Math.min(parallelWorkers, maxSlide));
+  if (workerCount === 1) {
+    return exportSlides(primaryPage, plugin, pdf, options);
+  }
+  if (workerCount < parallelWorkers) {
+    console.log(chalk.yellow(`\nOnly ${maxSlide} slide(s) to export; using ${workerCount} worker(s) instead of ${parallelWorkers}.`));
+  }
+
+  const ranges = partitionSlideRanges(maxSlide, workerCount);
+
+  // Create one dedicated page/plugin instance per worker (primary page covers the first range)
+  const workerPages = [primaryPage];
+  const workerPlugins = [plugin];
+
+  for (let i = 1; i < ranges.length; i++) {
+    const workerPage = await browser.newPage();
+    if (options.headers)
+      workerPage.setExtraHTTPHeaders(options.headers)
+    await workerPage.emulateMediaType('screen');
+
+    console.log(`Initializing worker ${i + 1}/${ranges.length}...`);
+    await workerPage.goto(options.url, { waitUntil: 'networkidle0', timeout: options.pageLoadTimeout });
+    await pause(options.loadPause);
+
+    const workerPlugin = await createPlugin(workerPage, allPlugins, options);
+    await configurePlugin(workerPlugin);
+    await configurePage(workerPage, workerPlugin, options);
+
+    workerPages.push(workerPage);
+    workerPlugins.push(workerPlugin);
+  }
+
+  console.log(`Exporting up to ${maxSlide} slides with ${ranges.length} workers...`);
+
+  const progress = { captured: 0, expected: maxSlide };
+  const results = await Promise.all(ranges.map((range, i) => captureSlideRange(
+    workerPages[i], workerPlugins[i], range,
+    { isLastWorker: i === ranges.length - 1, hasExplicitSlideCap: !!options.slides, totalSlides },
+    options, progress
+  )));
+
+  process.stdout.write('\n');
+
   const context = {
     progressBarOverflow : 0,
     currentSlide        : 1,
     exportedSlides      : 0,
     pdfFonts            : {},
     pdfXObjects         : {},
-    totalSlides         : await plugin.slideCount(),
+    totalSlides,
   };
 
-  // Create additional worker pages
-  const workerPages = [primaryPage];
-  const workerPlugins = [plugin];
-  
-  for (let i = 1; i < parallelWorkers; i++) {
-    const workerPage = await browser.newPage();
-    if (options.headers)
-      workerPage.setExtraHTTPHeaders(options.headers)
-    await workerPage.emulateMediaType('screen');
-    
-    console.log(`Initializing worker ${i + 1}/${parallelWorkers}...`);
-    await workerPage.goto(options.url, { waitUntil: 'networkidle0', timeout: options.pageLoadTimeout });
-    await pause(options.loadPause);
-    
-    const workerPlugin = await createPlugin(workerPage, allPlugins, options);
-    await configurePlugin(workerPlugin);
-    await configurePage(workerPage, workerPlugin, options);
-    
-    workerPages.push(workerPage);
-    workerPlugins.push(workerPlugin);
-  }
-
-  // Build list of slides to export
-  const maxSlide = options.slides ? Math.max(...Object.keys(options.slides)) : context.totalSlides;
-  const slidesToExport = [];
-  
-  for (let i = 1; i <= context.totalSlides && i <= maxSlide; i++) {
-    if (!options.slides || options.slides[i]) {
-      slidesToExport.push(i);
-    }
-  }
-
-  console.log(`Exporting ${slidesToExport.length} slides with ${parallelWorkers} workers...`);
-
-  // Process slides in parallel batches
-  const exportedSlides = new Map(); // slide number -> PDF buffer
-  const batchSize = Math.max(1, Math.ceil(slidesToExport.length / (parallelWorkers * 2)));
-
-  for (let batch = 0; batch < slidesToExport.length; batch += batchSize) {
-    const batchSlides = slidesToExport.slice(batch, Math.min(batch + batchSize, slidesToExport.length));
-    
-    const exportPromises = batchSlides.map(async (slideNum, idx) => {
-      const workerIndex = idx % parallelWorkers;
-      const workerPage = workerPages[workerIndex];
-      const workerPlugin = workerPlugins[workerIndex];
-      
-      // Navigate to the correct slide
-      await navigateToSlide(workerPage, workerPlugin, slideNum);
-      
-      // Pause and wait for dynamic content rendering (e.g., Chart.js, animations)
-      // This ensures parity with synchronous mode which waits before exporting
-      await pause(options.pause);
-      
-      // Wait for page to settle and render dynamic elements
-      await waitForPageReady(workerPage);
-      
-      // Pause videos and seek to start
-      await workerPage.evaluate(() => document.querySelectorAll('video').forEach(v => { v.pause(); v.currentTime = 0; }));
-      
-      // Export the slide
-      const buffer = await workerPage.pdf({
-        width               : options.size.width,
-        height              : options.size.height,
-        printBackground     : true,
-        pageRanges          : '1',
-        displayHeaderFooter : false,
-        timeout             : options.bufferTimeout,
-      });
-      
-      return { slideNum, buffer };
-    });
-
-    const results = await Promise.all(exportPromises);
-    
-    // Store results in order
-    for (const { slideNum, buffer } of results) {
-      exportedSlides.set(slideNum, buffer);
-      const progress = Math.min(batch + batchSlides.length, slidesToExport.length);
-      process.stdout.write('\r' + `Rendering slides ${progress}/${slidesToExport.length} ...`);
-    }
-  }
-
-  process.stdout.write('\n');
-
-  // Assemble exported slides in order
-  for (const slideNum of slidesToExport) {
-    const buffer = exportedSlides.get(slideNum);
+  // Assemble exported slides in order; sorting (rather than relying on a precomputed
+  // slide list) tolerates the last worker walking past its nominal range end.
+  const captured = results.flat().sort((a, b) => a.slideNum - b.slideNum);
+  for (const { buffer } of captured) {
     await printSlide(pdf, await PDFDocument.load(buffer, { parseSpeed: ParseSpeeds.Fastest }), context);
     context.exportedSlides++;
   }
@@ -498,47 +478,55 @@ async function exportSlidesParallel(browser, primaryPage, plugin, pdf, options, 
 }
 
 /**
- * Wait for the page to be ready for rendering
- * Ensures dynamic content like Canvas (Chart.js) has time to render
+ * Split [1, maxSlide] into workerCount contiguous ranges of near-equal size.
  */
-async function waitForPageReady(page) {
-  try {
-    // Wait for any pending animations or renders to complete
-    await page.waitForFunction(() => {
-      // Check if document is in a stable state
-      return document.readyState === 'complete';
-    }, { timeout: 5000 });
-  } catch (e) {
-    // Timeout is OK, just continue with rendering
+function partitionSlideRanges(maxSlide, workerCount) {
+  const base = Math.floor(maxSlide / workerCount);
+  const remainder = maxSlide % workerCount;
+  const ranges = [];
+  let start = 1;
+  for (let i = 0; i < workerCount; i++) {
+    const size = base + (i < remainder ? 1 : 0);
+    const end = start + size - 1;
+    ranges.push({ start, end });
+    start = end + 1;
   }
+  return ranges;
 }
 
 /**
- * Navigate to a specific slide number using the plugin's nextSlide method
+ * Walk a deck on a dedicated page from slide 1 up to (at least) range.end, capturing
+ * only the slides that fall within this worker's range and are selected by --slides.
+ * Slides outside the range are pure transit: no pause, since nothing is ever rendered
+ * from them (this intentionally diverges from the sequential loop, which pauses even
+ * on skipped slides -- there's nothing to let "settle" on a slide never captured).
  */
-async function navigateToSlide(page, plugin, targetSlideNum) {
-  // Get current position
-  const currentIndex = await page.evaluate(() => {
-    if (typeof Reveal !== 'undefined') {
-      const state = Reveal.getState();
-      return state.indexh;
-    }
-    return null;
-  });
+async function captureSlideRange(page, plugin, range, meta, options, progress) {
+  const localContext = { currentSlide: 1, totalSlides: meta.totalSlides };
+  const buffers = [];
+  // Only the last worker, and only absent an explicit --slides cap, may walk past its
+  // nominal range end -- guards against plugins whose slideCount() undercounts (e.g.
+  // reveal.js stacks/fragments) so the tail of the deck is never silently dropped.
+  const hardCap = (meta.isLastWorker && !meta.hasExplicitSlideCap) ? Infinity : range.end;
 
-  if (currentIndex === null) return; // Plugin doesn't expose state
+  const maybeCapture = async () => {
+    const n = localContext.currentSlide;
+    if (n < range.start || n > range.end) return;
+    if (options.slides && !options.slides[n]) return;
+    await pause(options.pause);
+    buffers.push({ slideNum: n, buffer: await captureSlideBuffer(page, options) });
+    progress.captured++;
+    process.stdout.write('\r' + `Rendering slides ${progress.captured}/${progress.expected} ...`);
+  };
 
-  const diff = targetSlideNum - (currentIndex + 1);
-
-  if (diff > 0) {
-    for (let i = 0; i < diff; i++) {
-      await plugin.nextSlide();
-    }
-  } else if (diff < 0) {
-    for (let i = 0; i < Math.abs(diff); i++) {
-      await page.evaluate(() => Reveal.prev?.());
-    }
+  await maybeCapture();
+  let hasNext = await hasNextSlide(plugin, localContext);
+  while (hasNext && localContext.currentSlide < hardCap) {
+    await nextSlide(plugin, localContext);
+    await maybeCapture();
+    hasNext = await hasNextSlide(plugin, localContext);
   }
+  return buffers;
 }
 
 async function exportSlides(page, plugin, pdf, options) {
@@ -582,17 +570,7 @@ async function exportSlides(page, plugin, pdf, options) {
 async function exportSlide(page, plugin, pdf, context, options) {
   process.stdout.write('\r' + await progressBar(plugin, context));
 
-  // Pause videos and seek to start to ensure deterministic rendering
-  await page.evaluate(() => document.querySelectorAll('video').forEach(v => { v.pause(); v.currentTime = 0; }));
-
-  const buffer = await page.pdf({
-    width               : options.size.width,
-    height              : options.size.height,
-    printBackground     : true,
-    pageRanges          : '1',
-    displayHeaderFooter : false,
-    timeout             : options.bufferTimeout,
-  });
+  const buffer = await captureSlideBuffer(page, options);
   await printSlide(pdf, await PDFDocument.load(buffer, { parseSpeed: ParseSpeeds.Fastest }), context);
   context.exportedSlides++;
 
@@ -612,6 +590,21 @@ async function exportSlide(page, plugin, pdf, context, options) {
       await pause(1000);
     }
   }
+}
+
+// Pauses videos and seeks them to start to ensure deterministic rendering, then
+// exports the current slide as a single-page PDF buffer. Shared by both the
+// sequential and parallel export paths so they can never silently diverge.
+async function captureSlideBuffer(page, options) {
+  await page.evaluate(() => document.querySelectorAll('video').forEach(v => { v.pause(); v.currentTime = 0; }));
+  return page.pdf({
+    width               : options.size.width,
+    height              : options.size.height,
+    printBackground     : true,
+    pageRanges          : '1',
+    displayHeaderFooter : false,
+    timeout             : options.bufferTimeout,
+  });
 }
 
 async function printSlide(pdf, slide, context) {
