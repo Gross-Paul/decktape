@@ -264,12 +264,25 @@ process.on('unhandledRejection', error => {
     console.log(chalk.cyan(`Using ${parallelWorkers} parallel workers for PDF export`));
   }
 
+  // Chromium throttles rendering (including requestAnimationFrame, which most charting
+  // libraries rely on to draw) for pages/tabs it doesn't consider foreground. That's
+  // invisible with a single page, but --parallel opens several pages in the same browser
+  // at once, and only one of them is ever "active" -- the rest get starved and can end up
+  // captured before they've actually drawn anything onto their canvases. Disable that
+  // backgrounding behavior (including Windows' native window occlusion detection) so every
+  // worker page renders normally regardless of focus.
+  const backgroundingArgs = [
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    '--disable-background-timer-throttling',
+    '--disable-features=CalculateNativeWinOcclusion',
+  ];
   const browser = await puppeteer.launch({
     headless       : options.headless,
     // TODO: add a verbose option
     // dumpio      : true,
     executablePath : options.chromePath,
-    args           : options.chromeArgs,
+    args           : [...backgroundingArgs, ...(options.chromeArgs || [])],
   });
   const page = await browser.newPage();
   if (options.headers)
