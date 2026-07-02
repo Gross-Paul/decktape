@@ -284,21 +284,7 @@ process.on('unhandledRejection', error => {
   if (options.metaTitle)
     pdf.setTitle(options.metaTitle);
 
-  page
-    .on('console', async msg => {
-      if (msg.type() === 'log') {
-        const args = await Promise.all(msg.args().map(arg => arg.evaluate(obj => obj, arg)));
-        console.log(...args.map(arg => color(msg.type())(util.format(arg))));
-      } else {
-        console.log(color(msg.type())(util.format(msg.text())));
-      }
-    })
-    .on('requestfailed', request => {
-      // do not output warning for cancelled requests
-      if (request.failure() && request.failure().errorText === 'net::ERR_ABORTED') return;
-      console.log(chalk.yellow('\nUnable to load resource from URL: %s'), request.url());
-    })
-    .on('pageerror', error => console.log(chalk.red('\nPage error: %s'), error.message));
+  wirePageDiagnostics(page, options.parallel > 1 ? 'worker 1' : undefined);
 
   console.log('Loading page', options.url, '...');
   const load = page.waitForNavigation({ waitUntil: 'load', timeout: options.urlLoadTimeout });
@@ -379,6 +365,29 @@ async function configurePlugin(plugin) {
   }
 }
 
+// Surfaces in-page console output, page errors and failed requests to the terminal.
+// Must be attached to every page (primary and workers): worker pages previously had
+// no listeners at all, so any JS error or resource failure happening on them (e.g. a
+// charting library failing to initialize) was silently swallowed.
+function wirePageDiagnostics(page, label) {
+  const prefix = label ? chalk.gray(`[${label}] `) : '';
+  page
+    .on('console', async msg => {
+      if (msg.type() === 'log') {
+        const args = await Promise.all(msg.args().map(arg => arg.evaluate(obj => obj, arg)));
+        console.log(prefix + args.map(arg => color(msg.type())(util.format(arg))).join(' '));
+      } else {
+        console.log(prefix + color(msg.type())(util.format(msg.text())));
+      }
+    })
+    .on('requestfailed', request => {
+      // do not output warning for cancelled requests
+      if (request.failure() && request.failure().errorText === 'net::ERR_ABORTED') return;
+      console.log(chalk.yellow('\n%sUnable to load resource from URL: %s'), prefix, request.url());
+    })
+    .on('pageerror', error => console.log(chalk.red('\n%sPage error: %s'), prefix, error.message));
+}
+
 /**
  * Export slides with parallel processing.
  * Each worker owns a dedicated Puppeteer page and walks the deck from slide 1
@@ -423,6 +432,7 @@ async function exportSlidesParallel(browser, primaryPage, plugin, pdf, options, 
     if (options.headers)
       workerPage.setExtraHTTPHeaders(options.headers)
     await workerPage.emulateMediaType('screen');
+    wirePageDiagnostics(workerPage, `worker ${i + 1}`);
 
     console.log(`Initializing worker ${i + 1}/${ranges.length}...`);
     await workerPage.goto(options.url, { waitUntil: 'networkidle0', timeout: options.pageLoadTimeout });
