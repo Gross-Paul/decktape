@@ -438,11 +438,17 @@ async function exportSlidesParallel(browser, primaryPage, plugin, pdf, options, 
 
   console.log(`Exporting up to ${maxSlide} slides with ${ranges.length} workers...`);
 
+  // Chromium shares a single GPU/rasterizer process across pages, so calling page.pdf()
+  // concurrently from multiple workers can capture canvas-based content (e.g. Chart.js)
+  // before it's composited, silently dropping it from the output. Slide navigation and
+  // settling still run fully in parallel; only the final PDF snapshot is serialized.
+  const pdfMutex = createMutex();
+
   const progress = { captured: 0, expected: maxSlide };
   const results = await Promise.all(ranges.map((range, i) => captureSlideRange(
     workerPages[i], workerPlugins[i], range,
     { isLastWorker: i === ranges.length - 1, hasExplicitSlideCap: !!options.slides, totalSlides },
-    options, progress
+    options, progress, pdfMutex
   )));
 
   process.stdout.write('\n');
@@ -478,6 +484,19 @@ async function exportSlidesParallel(browser, primaryPage, plugin, pdf, options, 
 }
 
 /**
+ * Serializes async work submitted from multiple workers so only one runs at a time,
+ * without blocking workers from continuing their own unrelated (non-serialized) work.
+ */
+function createMutex() {
+  let tail = Promise.resolve();
+  return fn => {
+    const result = tail.then(fn, fn);
+    tail = result.catch(() => {});
+    return result;
+  };
+}
+
+/**
  * Split [1, maxSlide] into workerCount contiguous ranges of near-equal size.
  */
 function partitionSlideRanges(maxSlide, workerCount) {
@@ -501,7 +520,7 @@ function partitionSlideRanges(maxSlide, workerCount) {
  * from them (this intentionally diverges from the sequential loop, which pauses even
  * on skipped slides -- there's nothing to let "settle" on a slide never captured).
  */
-async function captureSlideRange(page, plugin, range, meta, options, progress) {
+async function captureSlideRange(page, plugin, range, meta, options, progress, pdfMutex) {
   const localContext = { currentSlide: 1, totalSlides: meta.totalSlides };
   const buffers = [];
   // Only the last worker, and only absent an explicit --slides cap, may walk past its
@@ -514,7 +533,7 @@ async function captureSlideRange(page, plugin, range, meta, options, progress) {
     if (n < range.start || n > range.end) return;
     if (options.slides && !options.slides[n]) return;
     await pause(options.pause);
-    buffers.push({ slideNum: n, buffer: await captureSlideBuffer(page, options) });
+    buffers.push({ slideNum: n, buffer: await captureSlideBuffer(page, options, pdfMutex) });
     progress.captured++;
     process.stdout.write('\r' + `Rendering slides ${progress.captured}/${progress.expected} ...`);
   };
@@ -595,9 +614,9 @@ async function exportSlide(page, plugin, pdf, context, options) {
 // Pauses videos and seeks them to start to ensure deterministic rendering, then
 // exports the current slide as a single-page PDF buffer. Shared by both the
 // sequential and parallel export paths so they can never silently diverge.
-async function captureSlideBuffer(page, options) {
+async function captureSlideBuffer(page, options, pdfMutex) {
   await page.evaluate(() => document.querySelectorAll('video').forEach(v => { v.pause(); v.currentTime = 0; }));
-  return page.pdf({
+  const capture = () => page.pdf({
     width               : options.size.width,
     height              : options.size.height,
     printBackground     : true,
@@ -605,6 +624,7 @@ async function captureSlideBuffer(page, options) {
     displayHeaderFooter : false,
     timeout             : options.bufferTimeout,
   });
+  return pdfMutex ? pdfMutex(capture) : capture();
 }
 
 async function printSlide(pdf, slide, context) {
