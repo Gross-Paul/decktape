@@ -674,12 +674,20 @@ async function debugLogCanvases(page, label) {
       hasContent = `error: ${e.message}`;
     }
     const slide = c.closest('section');
+    const rect = c.parentElement ? c.parentElement.getBoundingClientRect() : null;
     return {
-      id       : c.id || '(no id)',
-      size     : `${c.width}x${c.height}`,
-      slideId  : slide ? (slide.id || '(no id)') : null,
-      visible  : slide ? getComputedStyle(slide).display !== 'none' : null,
+      id             : c.id || '(no id)',
+      size           : `${c.width}x${c.height}`,
+      slideId        : slide ? (slide.id || '(no id)') : null,
+      visible        : slide ? getComputedStyle(slide).display !== 'none' : null,
       hasContent,
+      chartLoaded    : typeof Chart !== 'undefined',
+      chartInstance  : typeof Chart !== 'undefined' && typeof Chart.getChart === 'function'
+        ? !!Chart.getChart(c)
+        : 'n/a',
+      parentRect     : rect ? `${Math.round(rect.width)}x${Math.round(rect.height)}` : null,
+      windowSize     : `${window.innerWidth}x${window.innerHeight}`,
+      visibilityState: document.visibilityState,
     };
   }));
   if (canvases.length) {
