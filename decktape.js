@@ -639,6 +639,7 @@ async function exportSlide(page, plugin, pdf, context, options) {
 // sequential and parallel export paths so they can never silently diverge.
 async function captureSlideBuffer(page, options, pdfMutex) {
   await page.evaluate(() => document.querySelectorAll('video').forEach(v => { v.pause(); v.currentTime = 0; }));
+  await debugLogCanvases(page);
   const capture = () => page.pdf({
     width               : options.size.width,
     height              : options.size.height,
@@ -648,6 +649,36 @@ async function captureSlideBuffer(page, options, pdfMutex) {
     timeout             : options.bufferTimeout,
   });
   return pdfMutex ? pdfMutex(capture) : capture();
+}
+
+// TEMPORARY diagnostic to pin down why some canvases (e.g. Chart.js) come out blank
+// specifically under --parallel. Logs, for every <canvas> on the page right before it's
+// captured, its pixel size, which slide section it belongs to, whether that slide is
+// currently visible, and whether it holds any non-transparent pixel data. Remove once
+// the root cause is confirmed.
+async function debugLogCanvases(page) {
+  const canvases = await page.evaluate(() => Array.from(document.querySelectorAll('canvas')).map(c => {
+    let hasContent;
+    try {
+      const ctx = c.getContext('2d');
+      hasContent = ctx && c.width && c.height
+        ? Array.from(ctx.getImageData(0, 0, c.width, c.height).data).some(v => v !== 0)
+        : false;
+    } catch (e) {
+      hasContent = `error: ${e.message}`;
+    }
+    const slide = c.closest('section');
+    return {
+      id       : c.id || '(no id)',
+      size     : `${c.width}x${c.height}`,
+      slideId  : slide ? (slide.id || '(no id)') : null,
+      visible  : slide ? getComputedStyle(slide).display !== 'none' : null,
+      hasContent,
+    };
+  }));
+  if (canvases.length) {
+    console.log('[canvas-check]', JSON.stringify(canvases));
+  }
 }
 
 async function printSlide(pdf, slide, context) {
