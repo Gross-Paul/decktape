@@ -643,8 +643,9 @@ async function exportSlide(page, plugin, pdf, context, options) {
 // sequential and parallel export paths so they can never silently diverge.
 async function captureSlideBuffer(page, options, pdfMutex) {
   await page.evaluate(() => document.querySelectorAll('video').forEach(v => { v.pause(); v.currentTime = 0; }));
-  await debugLogCanvases(page);
+  await debugLogCanvases(page, 'before-wait');
   await waitForVisibleCanvasesToRender(page);
+  await debugLogCanvases(page, 'after-wait');
   const capture = () => page.pdf({
     width               : options.size.width,
     height              : options.size.height,
@@ -661,7 +662,7 @@ async function captureSlideBuffer(page, options, pdfMutex) {
 // captured, its pixel size, which slide section it belongs to, whether that slide is
 // currently visible, and whether it holds any non-transparent pixel data. Remove once
 // the root cause is confirmed.
-async function debugLogCanvases(page) {
+async function debugLogCanvases(page, label) {
   const canvases = await page.evaluate(() => Array.from(document.querySelectorAll('canvas')).map(c => {
     let hasContent;
     try {
@@ -682,7 +683,7 @@ async function debugLogCanvases(page) {
     };
   }));
   if (canvases.length) {
-    console.log('[canvas-check]', JSON.stringify(canvases));
+    console.log(`[canvas-check:${label}]`, JSON.stringify(canvases));
   }
 }
 
