@@ -471,7 +471,7 @@ async function exportSlidesParallel(browser, primaryPage, plugin, pdf, options, 
   const results = await Promise.all(ranges.map((range, i) => captureSlideRange(
     workerPages[i], workerPlugins[i], range,
     { isLastWorker: i === ranges.length - 1, hasExplicitSlideCap: !!options.slides, totalSlides },
-    options, progress, pdfMutex
+    options, progress, pdfMutex, `worker ${i + 1}`
   )));
 
   process.stdout.write('\n');
@@ -543,7 +543,7 @@ function partitionSlideRanges(maxSlide, workerCount) {
  * from them (this intentionally diverges from the sequential loop, which pauses even
  * on skipped slides -- there's nothing to let "settle" on a slide never captured).
  */
-async function captureSlideRange(page, plugin, range, meta, options, progress, pdfMutex) {
+async function captureSlideRange(page, plugin, range, meta, options, progress, pdfMutex, workerLabel) {
   const localContext = { currentSlide: 1, totalSlides: meta.totalSlides };
   const buffers = [];
   // Only the last worker, and only absent an explicit --slides cap, may walk past its
@@ -556,6 +556,10 @@ async function captureSlideRange(page, plugin, range, meta, options, progress, p
     if (n < range.start || n > range.end) return;
     if (options.slides && !options.slides[n]) return;
     await pause(options.pause);
+    // TEMPORARY diagnostic: cross-check each worker's local slide count against what the
+    // plugin itself reports as the current slide, to catch two workers ending up on the
+    // same actual content (e.g. from slideCount() undercounting stacks/fragments).
+    console.log(`[capture] ${workerLabel} local#${n} plugin-index:${await plugin.currentSlideIndex()}`);
     buffers.push({ slideNum: n, buffer: await captureSlideBuffer(page, options, pdfMutex) });
     progress.captured++;
     process.stdout.write('\r' + `Rendering slides ${progress.captured}/${progress.expected} ...`);
@@ -640,6 +644,7 @@ async function exportSlide(page, plugin, pdf, context, options) {
 async function captureSlideBuffer(page, options, pdfMutex) {
   await page.evaluate(() => document.querySelectorAll('video').forEach(v => { v.pause(); v.currentTime = 0; }));
   await debugLogCanvases(page);
+  await waitForVisibleCanvasesToRender(page);
   const capture = () => page.pdf({
     width               : options.size.width,
     height              : options.size.height,
@@ -678,6 +683,34 @@ async function debugLogCanvases(page) {
   }));
   if (canvases.length) {
     console.log('[canvas-check]', JSON.stringify(canvases));
+  }
+}
+
+// Canvas libraries like Chart.js redraw asynchronously (via requestAnimationFrame or a
+// ResizeObserver callback) once their container becomes visible, which a fixed pause can
+// miss under --parallel. Rather than guessing at a longer delay, actively poll every
+// currently-visible canvas until it has non-transparent pixel data, up to a bounded
+// timeout -- slides with no canvas, or with a canvas that's blank by design, just hit the
+// timeout harmlessly and export as before.
+async function waitForVisibleCanvasesToRender(page, timeout = 3000) {
+  try {
+    await page.waitForFunction(() => {
+      const visible = Array.from(document.querySelectorAll('canvas')).filter(c => {
+        const slide = c.closest('section');
+        return !slide || getComputedStyle(slide).display !== 'none';
+      });
+      return visible.every(c => {
+        if (!c.width || !c.height) return false;
+        try {
+          const ctx = c.getContext('2d');
+          return ctx ? Array.from(ctx.getImageData(0, 0, c.width, c.height).data).some(v => v !== 0) : true;
+        } catch {
+          return true;
+        }
+      });
+    }, { timeout, polling: 100 });
+  } catch {
+    // Timeout: proceed with whatever state the canvases are in rather than failing the export.
   }
 }
 
