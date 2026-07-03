@@ -643,18 +643,28 @@ async function exportSlide(page, plugin, pdf, context, options) {
 // sequential and parallel export paths so they can never silently diverge.
 async function captureSlideBuffer(page, options, pdfMutex) {
   await page.evaluate(() => document.querySelectorAll('video').forEach(v => { v.pause(); v.currentTime = 0; }));
-  await debugLogCanvases(page, 'before-wait');
-  await waitForVisibleCanvasesToRender(page);
-  await debugLogCanvases(page, 'after-wait');
-  const capture = () => page.pdf({
-    width               : options.size.width,
-    height              : options.size.height,
-    printBackground     : true,
-    pageRanges          : '1',
-    displayHeaderFooter : false,
-    timeout             : options.bufferTimeout,
-  });
-  return pdfMutex ? pdfMutex(capture) : capture();
+  // Only one page in the browser is ever truly "visible" at a time; the rest report
+  // document.visibilityState === 'hidden' and Chromium skips layout/paint for them
+  // entirely (confirmed: canvases stay permanently 0x0 on backgrounded worker pages, no
+  // matter how long you wait). bringToFront() makes this page the real active one so
+  // layout/paint (and anything, like Chart.js, that depends on it) actually runs. This
+  // must happen atomically with the wait + capture that follow, since another worker's
+  // bringToFront() would immediately re-hide this page again.
+  const captureWhenFront = async () => {
+    await page.bringToFront();
+    await debugLogCanvases(page, 'before-wait');
+    await waitForVisibleCanvasesToRender(page);
+    await debugLogCanvases(page, 'after-wait');
+    return page.pdf({
+      width               : options.size.width,
+      height              : options.size.height,
+      printBackground     : true,
+      pageRanges          : '1',
+      displayHeaderFooter : false,
+      timeout             : options.bufferTimeout,
+    });
+  };
+  return pdfMutex ? pdfMutex(captureWhenFront) : captureWhenFront();
 }
 
 // TEMPORARY diagnostic to pin down why some canvases (e.g. Chart.js) come out blank
